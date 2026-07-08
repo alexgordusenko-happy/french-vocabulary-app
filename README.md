@@ -1,69 +1,51 @@
 # French Vocabulary Engine
 
-A simple Streamlit + SQLite app for learning French vocabulary with spaced repetition and AI-generated word cards.
+Personal French vocabulary app: Streamlit + SQLite + spaced repetition. Auto-fills word cards from **free public sources** — no API key or subscription required.
 
 ## What it does
 
-- Type a French word and let Claude fill in translation, IPA, explanations, and example sentences
-- Save English and Russian translations
-- Explanations in French and English
-- French and English example sentences
-- Review words due today
-- Weekly review view
-- Rate as Again / Hard / Good / Easy; next review date is scheduled automatically
+- Type a French word and it fills in:
+  - IPA pronunciation (from French Wiktionary)
+  - Short French definition (from Wiktionary)
+  - English and Russian translations (from MyMemory Translation)
+  - A French example sentence when available, translated to English
+- Save your own notes
+- Spaced-repetition review (Again / Hard / Good / Easy)
+- Search your vocabulary
+- Statistics
 
 ## Setup
 
-1. Install Python 3.10+.
-2. Install the requirements:
-
 ```bash
 pip install -r requirements.txt
-```
-
-3. Get an Anthropic API key from https://console.anthropic.com/settings/keys.
-
-4. Provide the key in one of three ways:
-
-**Environment variable (recommended for local dev):**
-```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-```
-
-**Streamlit secrets (recommended for Streamlit Cloud):**
-Create `.streamlit/secrets.toml`:
-```toml
-ANTHROPIC_API_KEY = "sk-ant-..."
-```
-
-**Sidebar input:** paste the key into the "Anthropic API key" field in the sidebar.
-
-5. Run the app:
-
-```bash
 streamlit run app.py
 ```
 
-## Using AI generation
+That's it. No account, no billing, no keys.
 
-On the "Add Word" page, type a French word in the "Generate with Claude" box and click **Generate**. Claude fills in all fields; edit them if you want, then click **Save word**.
+## Data sources
 
-Model used: `claude-haiku-4-5-20251001` (fast and cheap; ~fractions of a cent per word).
+- **fr.wiktionary.org** via the MediaWiki API — for IPA and the French definition
+- **api.mymemory.translated.net** — free translation, ~5000 words/day anonymous per IP
+
+## Limitations vs a paid AI
+
+- Wiktionary won't have every conjugated form; search for the base form (e.g. `préserver`, not `préservais`)
+- MyMemory translations are decent but not as smooth as Claude / GPT
+- If auto-fill returns nothing, just edit the fields manually and save
+
+If you later want higher-quality generation, you can swap in the Anthropic API (previous version of this app is available on request).
 
 ## Review system
 
-- Again: review in 1 day
-- Hard: review in 3 days
-- Good: review in 7 days
-- Easy: review in 14 days
+- Again: 1 day
+- Hard: 3 days
+- Good: 7 days
+- Easy: 14 days
 
-## Deploying on Streamlit Cloud
+## Ideas
 
-Add `ANTHROPIC_API_KEY` under **App settings → Secrets** on Streamlit Cloud. The app will pick it up via `st.secrets`.
-
-## Ideas for next steps
-
-- Audio pronunciation (ElevenLabs / Google TTS)
-- Tags, CEFR levels, grammar categories
-- Export to CSV / Anki
+- Audio pronunciation via `gTTS` (also free, no key)
+- CSV / Anki export
 - Quiz mode
+- Fallback lookup on en.wiktionary.org when fr.wiktionary has no page

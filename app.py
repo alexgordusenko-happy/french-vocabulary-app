@@ -1,9 +1,9 @@
-import json
-import os
+import re
 import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
 
+import requests
 import streamlit as st
 
 DB_PATH = Path(__file__).with_name("vocabulary.db")
@@ -142,51 +142,124 @@ def delete_word(word_id):
         conn.commit()
 
 
-# ---------- AI generation ----------
+# ---------- Free public data sources (no API key) ----------
 
-def get_api_key():
-    """Read the key from Streamlit secrets, env var, or session state."""
-    return (
-        st.session_state.get("anthropic_api_key")
-        or os.environ.get("ANTHROPIC_API_KEY")
-        or st.secrets.get("ANTHROPIC_API_KEY", "") if hasattr(st, "secrets") else ""
-    )
+WIKTIONARY_URL = "https://fr.wiktionary.org/w/api.php"
+MYMEMORY_URL = "https://api.mymemory.translated.net/get"
+HEADERS = {"User-Agent": "FrenchVocabApp/1.0 (personal learning tool)"}
 
 
-def generate_word_data(french_word: str, api_key: str) -> dict:
-    """Ask Claude to fill in all vocabulary fields for a French word."""
-    import anthropic
+def fetch_wiktionary(word: str) -> str:
+    """Fetch raw wikitext of a French word page from fr.wiktionary.org."""
+    params = {
+        "action": "parse",
+        "page": word,
+        "format": "json",
+        "prop": "wikitext",
+        "redirects": 1,
+    }
+    r = requests.get(WIKTIONARY_URL, params=params, headers=HEADERS, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if "error" in data:
+        return ""
+    return data.get("parse", {}).get("wikitext", {}).get("*", "")
 
-    client = anthropic.Anthropic(api_key=api_key)
 
-    prompt = f"""You are a French language teacher. For the French word or expression "{french_word}", return a JSON object with exactly these keys and nothing else:
+def extract_ipa(wikitext: str) -> str:
+    """Pull IPA out of {{pron|...|fr}} template."""
+    m = re.search(r"\{\{pron\|([^|}]+)\|fr\}\}", wikitext)
+    if m:
+        ipa = m.group(1).strip()
+        return f"/{ipa}/"
+    return ""
 
-- "english_translation": short English translation (may include a couple of variants separated by " / ")
-- "russian_translation": short Russian translation (may include variants separated by " / ")
-- "pronunciation": IPA transcription in slashes, e.g. "/pʁe.zɛʁ.ve/"
-- "explanation_fr": one clear sentence in French explaining the meaning
-- "explanation_en": one clear sentence in English explaining the meaning
-- "example_fr": one natural French example sentence using the word
-- "example_en": English translation of that example sentence
 
-Return ONLY the JSON object, no markdown fences, no commentary."""
+def _clean_wiki(text: str) -> str:
+    """Strip common wikitext markup for display."""
+    # Remove templates {{...}}
+    text = re.sub(r"\{\{[^{}]*\}\}", "", text)
+    # [[link|display]] -> display, [[link]] -> link
+    text = re.sub(r"\[\[([^\]|]+)\|([^\]]+)\]\]", r"\2", text)
+    text = re.sub(r"\[\[([^\]]+)\]\]", r"\1", text)
+    # HTML tags
+    text = re.sub(r"<[^>]+>", "", text)
+    # ''italic'' and '''bold'''
+    text = re.sub(r"'{2,}", "", text)
+    return text.strip(" *#:;-").strip()
 
-    msg = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=800,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = msg.content[0].text.strip()
 
-    # Strip accidental code fences.
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
-        text = text.strip()
+def extract_definition_fr(wikitext: str) -> str:
+    """Pull the first numbered definition from the French section."""
+    # Locate French section (== {{langue|fr}} ==)
+    fr_match = re.search(r"==\s*\{\{langue\|fr\}\}\s*==", wikitext)
+    section = wikitext[fr_match.end():] if fr_match else wikitext
+    # Stop at next language
+    next_lang = re.search(r"\n==\s*\{\{langue\|", section)
+    if next_lang:
+        section = section[: next_lang.start()]
+    # First numbered line "# definition"
+    for line in section.splitlines():
+        line = line.rstrip()
+        if line.startswith("#") and not line.startswith("#*") and not line.startswith("#:"):
+            return _clean_wiki(line[1:])
+    return ""
 
-    data = json.loads(text)
-    return {k: str(data.get(k, "")) for k in AI_FIELDS}
+
+def extract_example_fr(wikitext: str) -> str:
+    """Pull the first example from the French section (lines starting with #*)."""
+    fr_match = re.search(r"==\s*\{\{langue\|fr\}\}\s*==", wikitext)
+    section = wikitext[fr_match.end():] if fr_match else wikitext
+    next_lang = re.search(r"\n==\s*\{\{langue\|", section)
+    if next_lang:
+        section = section[: next_lang.start()]
+    for line in section.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#*") and not stripped.startswith("#*:"):
+            example = _clean_wiki(stripped[2:])
+            if example:
+                return example
+    return ""
+
+
+def mymemory_translate(text: str, lang_pair: str) -> str:
+    """Free translation API — up to ~5000 words/day anonymous."""
+    if not text:
+        return ""
+    try:
+        r = requests.get(
+            MYMEMORY_URL,
+            params={"q": text, "langpair": lang_pair},
+            headers=HEADERS,
+            timeout=10,
+        )
+        r.raise_for_status()
+        return r.json().get("responseData", {}).get("translatedText", "")
+    except Exception:
+        return ""
+
+
+def generate_word_data(french_word: str) -> dict:
+    """Use Wiktionary + MyMemory to fill in fields — no API key required."""
+    result = {f: "" for f in AI_FIELDS}
+    wikitext = fetch_wiktionary(french_word)
+
+    if wikitext:
+        result["pronunciation"] = extract_ipa(wikitext)
+        result["explanation_fr"] = extract_definition_fr(wikitext)
+        result["example_fr"] = extract_example_fr(wikitext)
+
+    # Translations via MyMemory
+    result["english_translation"] = mymemory_translate(french_word, "fr|en")
+    result["russian_translation"] = mymemory_translate(french_word, "fr|ru")
+
+    if result["explanation_fr"]:
+        result["explanation_en"] = mymemory_translate(result["explanation_fr"], "fr|en")
+
+    if result["example_fr"]:
+        result["example_en"] = mymemory_translate(result["example_fr"], "fr|en")
+
+    return result
 
 
 # ---------- UI ----------
@@ -231,40 +304,36 @@ def show_word_card(row, show_review_buttons=False):
 
 def add_word_page():
     st.header("Add a French word")
-    st.write("Type a French word, generate the fields with AI, then edit and save.")
+    st.write("Type a French word, auto-fill from Wiktionary + MyMemory, then edit and save.")
 
-    # Prefill store for the form (so the Generate button can populate it).
     prefill = st.session_state.setdefault("prefill", {f: "" for f in AI_FIELDS})
 
-    # --- AI generator, OUTSIDE the form so it can update fields before submit ---
     with st.container(border=True):
-        st.markdown("**Generate with Claude**")
-        api_key = get_api_key()
-        if not api_key:
-            st.info("No API key found. Set ANTHROPIC_API_KEY, add it to `.streamlit/secrets.toml`, or paste it in the sidebar.")
+        st.markdown("**Auto-fill from public sources**")
+        st.caption("Uses fr.wiktionary.org for IPA + French definition, and MyMemory for translations. Free, no key.")
 
         word_to_generate = st.text_input(
-            "French word for AI to expand",
+            "French word",
             key="ai_word_input",
             placeholder="préserver",
         )
-        if st.button("Generate", type="primary", disabled=not api_key):
+        if st.button("Auto-fill", type="primary"):
             if not word_to_generate.strip():
                 st.error("Enter a French word first.")
             else:
                 try:
-                    with st.spinner("Asking Claude..."):
-                        result = generate_word_data(word_to_generate.strip(), api_key)
-                    st.session_state["prefill"] = result
-                    st.session_state["prefill_french"] = word_to_generate.strip()
-                    st.success("Fields filled. Review below and save.")
-                    st.rerun()
-                except json.JSONDecodeError:
-                    st.error("Claude did not return valid JSON. Try again.")
-                except Exception as e:
-                    st.error(f"AI error: {e}")
+                    with st.spinner("Fetching data..."):
+                        result = generate_word_data(word_to_generate.strip())
+                    if not any(result.values()):
+                        st.warning("Nothing found. Check spelling, or fill in manually below.")
+                    else:
+                        st.session_state["prefill"] = result
+                        st.session_state["prefill_french"] = word_to_generate.strip()
+                        st.success("Fields filled. Review below and save.")
+                        st.rerun()
+                except requests.RequestException as e:
+                    st.error(f"Network error: {e}")
 
-    # --- Manual/edit form ---
     with st.form("add_word_form", clear_on_submit=True):
         french_word = st.text_input(
             "French word *",
@@ -297,7 +366,6 @@ def add_word_page():
             "example_en": example_en,
             "notes": notes,
         })
-        # Clear prefill after save.
         st.session_state["prefill"] = {f: "" for f in AI_FIELDS}
         st.session_state["prefill_french"] = ""
         st.success(f"Saved: {french_word}")
@@ -364,28 +432,12 @@ def statistics_page():
         st.bar_chart(counts)
 
 
-def sidebar_api_key():
-    with st.sidebar:
-        st.markdown("### AI settings")
-        current = st.session_state.get("anthropic_api_key", "")
-        key_input = st.text_input(
-            "Anthropic API key",
-            value=current,
-            type="password",
-            help="Or set the ANTHROPIC_API_KEY environment variable / secrets.toml.",
-        )
-        if key_input != current:
-            st.session_state["anthropic_api_key"] = key_input
-
-
 def main():
     st.set_page_config(page_title="French Vocabulary Engine", page_icon="FR", layout="wide")
     init_db()
 
     st.title("French Vocabulary Engine")
-    st.caption("A simple personal app for learning and reviewing French words.")
-
-    sidebar_api_key()
+    st.caption("Personal French learning app — spaced repetition + free auto-fill.")
 
     page = st.sidebar.radio(
         "Menu",
