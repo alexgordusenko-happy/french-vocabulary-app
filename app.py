@@ -146,6 +146,7 @@ def delete_word(word_id):
 
 WIKTIONARY_URL = "https://fr.wiktionary.org/w/api.php"
 MYMEMORY_URL = "https://api.mymemory.translated.net/get"
+TATOEBA_URL = "https://tatoeba.org/eng/api_v0/search"
 HEADERS = {"User-Agent": "FrenchVocabApp/1.0 (personal learning tool)"}
 
 
@@ -222,6 +223,60 @@ def extract_example_fr(wikitext: str) -> str:
     return ""
 
 
+def fetch_tatoeba_example(word: str, target_lang: str = "eng") -> tuple[str, str]:
+    """
+    Query Tatoeba for a French sentence containing `word`, with a translation
+    in `target_lang` ('eng' or 'rus'). Returns (french_sentence, translation).
+    Prefers shorter sentences (better for learners).
+    """
+    try:
+        r = requests.get(
+            TATOEBA_URL,
+            params={
+                "from": "fra",
+                "to": target_lang,
+                "query": word,
+                "sort": "relevance",
+                "orphans": "no",
+                "unapproved": "no",
+            },
+            headers=HEADERS,
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return "", ""
+
+    results = data.get("results") or []
+    candidates = []
+    for item in results:
+        fr_text = item.get("text", "").strip()
+        if not fr_text:
+            continue
+        # translations is a list of groups; each group is a list of dicts
+        translations = item.get("translations") or []
+        for group in translations:
+            for t in group:
+                if t.get("lang") == target_lang and t.get("text"):
+                    candidates.append((fr_text, t["text"].strip()))
+                    break
+            if candidates and candidates[-1][0] == fr_text:
+                break
+
+    if not candidates:
+        return "", ""
+
+    # Prefer sentences between 30 and 120 chars — comfortable for learners.
+    candidates.sort(
+        key=lambda p: (
+            0 if 30 <= len(p[0]) <= 120 else 1,
+            len(p[0]),
+        )
+    )
+    return candidates[0]
+
+
 def mymemory_translate(text: str, lang_pair: str) -> str:
     """Free translation API — up to ~5000 words/day anonymous."""
     if not text:
@@ -240,24 +295,37 @@ def mymemory_translate(text: str, lang_pair: str) -> str:
 
 
 def generate_word_data(french_word: str) -> dict:
-    """Use Wiktionary + MyMemory to fill in fields — no API key required."""
+    """
+    Fill in fields from free public sources — no API key required.
+      - Wiktionary: IPA + French definition
+      - Tatoeba: real native example sentences (French + English translation)
+      - MyMemory: word translations (English, Russian), definition translation
+    """
     result = {f: "" for f in AI_FIELDS}
-    wikitext = fetch_wiktionary(french_word)
 
+    wikitext = fetch_wiktionary(french_word)
     if wikitext:
         result["pronunciation"] = extract_ipa(wikitext)
         result["explanation_fr"] = extract_definition_fr(wikitext)
-        result["example_fr"] = extract_example_fr(wikitext)
 
-    # Translations via MyMemory
+    # Word translations
     result["english_translation"] = mymemory_translate(french_word, "fr|en")
     result["russian_translation"] = mymemory_translate(french_word, "fr|ru")
 
+    # Definition translation
     if result["explanation_fr"]:
         result["explanation_en"] = mymemory_translate(result["explanation_fr"], "fr|en")
 
-    if result["example_fr"]:
-        result["example_en"] = mymemory_translate(result["example_fr"], "fr|en")
+    # Example sentence: prefer Tatoeba (native, real), fall back to Wiktionary
+    fr_sent, en_sent = fetch_tatoeba_example(french_word, "eng")
+    if fr_sent:
+        result["example_fr"] = fr_sent
+        result["example_en"] = en_sent
+    elif wikitext:
+        wik_ex = extract_example_fr(wikitext)
+        if wik_ex:
+            result["example_fr"] = wik_ex
+            result["example_en"] = mymemory_translate(wik_ex, "fr|en")
 
     return result
 
@@ -310,7 +378,7 @@ def add_word_page():
 
     with st.container(border=True):
         st.markdown("**Auto-fill from public sources**")
-        st.caption("Uses fr.wiktionary.org for IPA + French definition, and MyMemory for translations. Free, no key.")
+        st.caption("Wiktionary (IPA + definition) · Tatoeba (real example sentences) · MyMemory (translations). Free, no key.")
 
         word_to_generate = st.text_input(
             "French word",

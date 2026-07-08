@@ -25,8 +25,9 @@ That's it. No account, no billing, no keys.
 
 ## Data sources
 
-- **fr.wiktionary.org** via the MediaWiki API — for IPA and the French definition
-- **api.mymemory.translated.net** — free translation, ~5000 words/day anonymous per IP
+- **fr.wiktionary.org** via the MediaWiki API — IPA pronunciation and French definition
+- **tatoeba.org** API — real bilingual example sentences contributed by native speakers (this is what replaces Reverso Context)
+- **api.mymemory.translated.net** — word translations (English + Russian), ~5000 words/day anonymous per IP
 
 ## Limitations vs a paid AI
 
