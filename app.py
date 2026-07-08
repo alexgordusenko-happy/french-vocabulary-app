@@ -16,8 +16,13 @@ RATING_INTERVALS = {
     "Easy": 14,
 }
 
-GEMINI_MODEL = "gemini-2.0-flash"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+# Free-tier friendly models, tried in order. Lite variants have the most generous free quota.
+GEMINI_MODELS = [
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+    "gemini-2.0-flash",
+]
+GEMINI_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 AI_FIELDS = [
     "alt_form",
@@ -175,8 +180,33 @@ def get_api_key() -> str:
         return ""
 
 
+def _call_gemini(model: str, prompt: str, api_key: str) -> str:
+    """Call one Gemini model and return the raw text output."""
+    r = requests.post(
+        GEMINI_URL_TMPL.format(model=model),
+        params={"key": api_key},
+        headers={"Content-Type": "application/json"},
+        json={
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": 0.4,
+            },
+        },
+        timeout=45,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    return payload["candidates"][0]["content"]["parts"][0]["text"]
+
+
 def generate_word_data(french_word: str, api_key: str) -> dict:
     """Ask Gemini for a fully-structured flashcard. Free-tier friendly."""
+    # Session cache — same word never re-hits the API in one session.
+    cache = st.session_state.setdefault("word_cache", {})
+    if french_word in cache:
+        return cache[french_word]
+
     prompt = f"""You are a French vocabulary teacher preparing flashcards for a Russian-speaking learner of French.
 
 For the French word or expression: "{french_word}"
@@ -193,26 +223,21 @@ Return ONLY a JSON object with these EXACT keys:
 
 Return ONLY the JSON. No markdown code fences, no commentary."""
 
-    r = requests.post(
-        GEMINI_URL,
-        params={"key": api_key},
-        headers={"Content-Type": "application/json"},
-        json={
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "temperature": 0.4,
-            },
-        },
-        timeout=45,
-    )
-    r.raise_for_status()
-    payload = r.json()
-
-    try:
-        text = payload["candidates"][0]["content"]["parts"][0]["text"]
-    except (KeyError, IndexError):
-        raise RuntimeError(f"Unexpected Gemini response: {payload}")
+    # Try each model in order; fall through on 429/rate-limit errors.
+    last_err = None
+    text = None
+    for model in GEMINI_MODELS:
+        try:
+            text = _call_gemini(model, prompt, api_key)
+            st.session_state["last_model_used"] = model
+            break
+        except requests.HTTPError as e:
+            last_err = e
+            if e.response.status_code in (429, 503):
+                continue  # rate limited / overloaded — try next model
+            raise
+    if text is None:
+        raise last_err
 
     text = text.strip()
     if text.startswith("```"):
@@ -224,7 +249,7 @@ Return ONLY the JSON. No markdown code fences, no commentary."""
     data = json.loads(text)
     examples = data.get("examples") or []
 
-    return {
+    result = {
         "alt_form": (data.get("alt_form") or "").strip(),
         "pronunciation": (data.get("pronunciation") or "").strip(),
         "alt_pronunciation": (data.get("alt_pronunciation") or "").strip(),
@@ -235,6 +260,8 @@ Return ONLY the JSON. No markdown code fences, no commentary."""
         "example_en": EX_SEP.join((e.get("en") or "").strip() for e in examples),
         "example_ru": EX_SEP.join((e.get("ru") or "").strip() for e in examples),
     }
+    cache[french_word] = result
+    return result
 
 
 # ---------- UI helpers ----------
@@ -328,6 +355,10 @@ def add_word_page():
             key="ai_word_input",
             placeholder="encombrant",
         )
+        last_model = st.session_state.get("last_model_used")
+        if last_model:
+            st.caption(f"Last generation used model: `{last_model}`")
+
         if st.button("Auto-fill", type="primary", disabled=not api_key):
             if not word_to_generate.strip():
                 st.error("Enter a French word first.")
@@ -342,7 +373,15 @@ def add_word_page():
                 except json.JSONDecodeError:
                     st.error("Gemini didn't return valid JSON. Try again.")
                 except requests.HTTPError as e:
-                    st.error(f"Gemini API error: {e.response.status_code} — {e.response.text[:300]}")
+                    if e.response.status_code == 429:
+                        st.error(
+                            "**Gemini quota exceeded (429).** All free-tier models are rate-limited right now.\n\n"
+                            "• Wait ~60 seconds and try again (per-minute cap)\n"
+                            "• Or wait until midnight Pacific time (daily cap resets)\n"
+                            "• Check usage: https://ai.dev/rate-limit"
+                        )
+                    else:
+                        st.error(f"Gemini API error: {e.response.status_code} — {e.response.text[:300]}")
                 except Exception as e:
                     st.error(f"Error: {e}")
 
