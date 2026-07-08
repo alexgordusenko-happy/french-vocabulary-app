@@ -1,4 +1,5 @@
-import re
+import json
+import os
 import sqlite3
 from datetime import date, timedelta
 from pathlib import Path
@@ -15,15 +16,22 @@ RATING_INTERVALS = {
     "Easy": 14,
 }
 
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
 AI_FIELDS = [
-    "english_translation",
-    "russian_translation",
+    "alt_form",
     "pronunciation",
-    "explanation_fr",
-    "explanation_en",
+    "alt_pronunciation",
+    "english_translation",   # holds "Meaning / English"
+    "russian_translation",   # holds "Русский"
+    "explanation_fr",        # holds "Use / Français" (the "On utilise..." sentence)
     "example_fr",
     "example_en",
+    "example_ru",
 ]
+
+EX_SEP = "\n\n"  # separator between example sentences inside a single column
 
 
 # ---------- Database ----------
@@ -39,13 +47,16 @@ def init_db():
             CREATE TABLE IF NOT EXISTS words (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 french_word TEXT NOT NULL,
+                alt_form TEXT,
+                pronunciation TEXT,
+                alt_pronunciation TEXT,
                 english_translation TEXT,
                 russian_translation TEXT,
                 explanation_fr TEXT,
                 explanation_en TEXT,
                 example_fr TEXT,
                 example_en TEXT,
-                pronunciation TEXT,
+                example_ru TEXT,
                 notes TEXT,
                 created_at TEXT NOT NULL,
                 last_reviewed TEXT,
@@ -55,6 +66,11 @@ def init_db():
             )
             """
         )
+        # Migrations for older DBs
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(words)").fetchall()]
+        for col in ["alt_form", "alt_pronunciation", "example_ru"]:
+            if col not in cols:
+                conn.execute(f"ALTER TABLE words ADD COLUMN {col} TEXT")
         conn.commit()
 
 
@@ -64,21 +80,25 @@ def add_word(data):
         conn.execute(
             """
             INSERT INTO words (
-                french_word, english_translation, russian_translation,
-                explanation_fr, explanation_en, example_fr, example_en,
-                pronunciation, notes, created_at, next_review
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                french_word, alt_form, pronunciation, alt_pronunciation,
+                english_translation, russian_translation,
+                explanation_fr,
+                example_fr, example_en, example_ru,
+                notes, created_at, next_review
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 data["french_word"].strip(),
-                data["english_translation"].strip(),
-                data["russian_translation"].strip(),
-                data["explanation_fr"].strip(),
-                data["explanation_en"].strip(),
-                data["example_fr"].strip(),
-                data["example_en"].strip(),
-                data["pronunciation"].strip(),
-                data["notes"].strip(),
+                data.get("alt_form", "").strip(),
+                data.get("pronunciation", "").strip(),
+                data.get("alt_pronunciation", "").strip(),
+                data.get("english_translation", "").strip(),
+                data.get("russian_translation", "").strip(),
+                data.get("explanation_fr", "").strip(),
+                data.get("example_fr", "").strip(),
+                data.get("example_en", "").strip(),
+                data.get("example_ru", "").strip(),
+                data.get("notes", "").strip(),
                 today,
                 today,
             ),
@@ -142,222 +162,141 @@ def delete_word(word_id):
         conn.commit()
 
 
-# ---------- Free public data sources (no API key) ----------
+# ---------- Gemini (free tier, no billing) ----------
 
-WIKTIONARY_URL = "https://fr.wiktionary.org/w/api.php"
-MYMEMORY_URL = "https://api.mymemory.translated.net/get"
-TATOEBA_URL = "https://tatoeba.org/eng/api_v0/search"
-HEADERS = {"User-Agent": "FrenchVocabApp/1.0 (personal learning tool)"}
-
-
-def fetch_wiktionary(word: str) -> str:
-    """Fetch raw wikitext of a French word page from fr.wiktionary.org."""
-    params = {
-        "action": "parse",
-        "page": word,
-        "format": "json",
-        "prop": "wikitext",
-        "redirects": 1,
-    }
-    r = requests.get(WIKTIONARY_URL, params=params, headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    if "error" in data:
-        return ""
-    return data.get("parse", {}).get("wikitext", {}).get("*", "")
-
-
-def extract_ipa(wikitext: str) -> str:
-    """Pull IPA out of {{pron|...|fr}} template."""
-    m = re.search(r"\{\{pron\|([^|}]+)\|fr\}\}", wikitext)
-    if m:
-        ipa = m.group(1).strip()
-        return f"/{ipa}/"
-    return ""
-
-
-def _clean_wiki(text: str) -> str:
-    """Strip common wikitext markup for display."""
-    # Remove templates {{...}}
-    text = re.sub(r"\{\{[^{}]*\}\}", "", text)
-    # [[link|display]] -> display, [[link]] -> link
-    text = re.sub(r"\[\[([^\]|]+)\|([^\]]+)\]\]", r"\2", text)
-    text = re.sub(r"\[\[([^\]]+)\]\]", r"\1", text)
-    # HTML tags
-    text = re.sub(r"<[^>]+>", "", text)
-    # ''italic'' and '''bold'''
-    text = re.sub(r"'{2,}", "", text)
-    return text.strip(" *#:;-").strip()
-
-
-def extract_definition_fr(wikitext: str) -> str:
-    """Pull the first numbered definition from the French section."""
-    # Locate French section (== {{langue|fr}} ==)
-    fr_match = re.search(r"==\s*\{\{langue\|fr\}\}\s*==", wikitext)
-    section = wikitext[fr_match.end():] if fr_match else wikitext
-    # Stop at next language
-    next_lang = re.search(r"\n==\s*\{\{langue\|", section)
-    if next_lang:
-        section = section[: next_lang.start()]
-    # First numbered line "# definition"
-    for line in section.splitlines():
-        line = line.rstrip()
-        if line.startswith("#") and not line.startswith("#*") and not line.startswith("#:"):
-            return _clean_wiki(line[1:])
-    return ""
-
-
-def extract_example_fr(wikitext: str) -> str:
-    """Pull the first example from the French section (lines starting with #*)."""
-    fr_match = re.search(r"==\s*\{\{langue\|fr\}\}\s*==", wikitext)
-    section = wikitext[fr_match.end():] if fr_match else wikitext
-    next_lang = re.search(r"\n==\s*\{\{langue\|", section)
-    if next_lang:
-        section = section[: next_lang.start()]
-    for line in section.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#*") and not stripped.startswith("#*:"):
-            example = _clean_wiki(stripped[2:])
-            if example:
-                return example
-    return ""
-
-
-def fetch_tatoeba_example(word: str, target_lang: str = "eng") -> tuple[str, str]:
-    """
-    Query Tatoeba for a French sentence containing `word`, with a translation
-    in `target_lang` ('eng' or 'rus'). Returns (french_sentence, translation).
-    Prefers shorter sentences (better for learners).
-    """
+def get_api_key() -> str:
+    if st.session_state.get("gemini_api_key"):
+        return st.session_state["gemini_api_key"]
+    if os.environ.get("GEMINI_API_KEY"):
+        return os.environ["GEMINI_API_KEY"]
     try:
-        r = requests.get(
-            TATOEBA_URL,
-            params={
-                "from": "fra",
-                "to": target_lang,
-                "query": word,
-                "sort": "relevance",
-                "orphans": "no",
-                "unapproved": "no",
+        return st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        return ""
+
+
+def generate_word_data(french_word: str, api_key: str) -> dict:
+    """Ask Gemini for a fully-structured flashcard. Free-tier friendly."""
+    prompt = f"""You are a French vocabulary teacher preparing flashcards for a Russian-speaking learner of French.
+
+For the French word or expression: "{french_word}"
+
+Return ONLY a JSON object with these EXACT keys:
+- "word": string — the canonical French form
+- "alt_form": string — alternate form when relevant (feminine for adjectives, feminine noun, plural, or noun/verb variant). Empty string "" if none.
+- "pronunciation": string — IPA in square brackets, e.g. "[ɑ̃.kɔ̃.bʁɑ̃]"
+- "alt_pronunciation": string — IPA of alt_form. Empty "" if no alt_form.
+- "meaning_en": string — short comma-separated English meanings, e.g. "bulky, cumbersome, takes up too much space"
+- "meaning_ru": string — short comma-separated Russian meanings, e.g. "громоздкий, неудобный, занимающий много места"
+- "use_fr": string — ONE natural French sentence starting with "On utilise" explaining when to use the word
+- "examples": array of EXACTLY 3 objects, each with keys "fr", "en", "ru" — short, natural sentences. If the word can be both a noun and a verb, include both senses across the examples.
+
+Return ONLY the JSON. No markdown code fences, no commentary."""
+
+    r = requests.post(
+        GEMINI_URL,
+        params={"key": api_key},
+        headers={"Content-Type": "application/json"},
+        json={
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "temperature": 0.4,
             },
-            headers=HEADERS,
-            timeout=10,
-        )
-        r.raise_for_status()
-        data = r.json()
-    except Exception:
-        return "", ""
-
-    results = data.get("results") or []
-    candidates = []
-    for item in results:
-        fr_text = item.get("text", "").strip()
-        if not fr_text:
-            continue
-        # translations is a list of groups; each group is a list of dicts
-        translations = item.get("translations") or []
-        for group in translations:
-            for t in group:
-                if t.get("lang") == target_lang and t.get("text"):
-                    candidates.append((fr_text, t["text"].strip()))
-                    break
-            if candidates and candidates[-1][0] == fr_text:
-                break
-
-    if not candidates:
-        return "", ""
-
-    # Prefer sentences between 30 and 120 chars — comfortable for learners.
-    candidates.sort(
-        key=lambda p: (
-            0 if 30 <= len(p[0]) <= 120 else 1,
-            len(p[0]),
-        )
+        },
+        timeout=45,
     )
-    return candidates[0]
+    r.raise_for_status()
+    payload = r.json()
 
-
-def mymemory_translate(text: str, lang_pair: str) -> str:
-    """Free translation API — up to ~5000 words/day anonymous."""
-    if not text:
-        return ""
     try:
-        r = requests.get(
-            MYMEMORY_URL,
-            params={"q": text, "langpair": lang_pair},
-            headers=HEADERS,
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json().get("responseData", {}).get("translatedText", "")
-    except Exception:
+        text = payload["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        raise RuntimeError(f"Unexpected Gemini response: {payload}")
+
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:]
+        text = text.strip()
+
+    data = json.loads(text)
+    examples = data.get("examples") or []
+
+    return {
+        "alt_form": (data.get("alt_form") or "").strip(),
+        "pronunciation": (data.get("pronunciation") or "").strip(),
+        "alt_pronunciation": (data.get("alt_pronunciation") or "").strip(),
+        "english_translation": (data.get("meaning_en") or "").strip(),
+        "russian_translation": (data.get("meaning_ru") or "").strip(),
+        "explanation_fr": (data.get("use_fr") or "").strip(),
+        "example_fr": EX_SEP.join((e.get("fr") or "").strip() for e in examples),
+        "example_en": EX_SEP.join((e.get("en") or "").strip() for e in examples),
+        "example_ru": EX_SEP.join((e.get("ru") or "").strip() for e in examples),
+    }
+
+
+# ---------- UI helpers ----------
+
+def _split_ex(block: str) -> list:
+    return [s.strip() for s in (block or "").split(EX_SEP) if s.strip()]
+
+
+def _val(row, key):
+    """Safe access for optional columns."""
+    try:
+        v = row[key]
+        return v if v is not None else ""
+    except (KeyError, IndexError):
         return ""
 
 
-def generate_word_data(french_word: str) -> dict:
-    """
-    Fill in fields from free public sources — no API key required.
-      - Wiktionary: IPA + French definition
-      - Tatoeba: real native example sentences (French + English translation)
-      - MyMemory: word translations (English, Russian), definition translation
-    """
-    result = {f: "" for f in AI_FIELDS}
-
-    wikitext = fetch_wiktionary(french_word)
-    if wikitext:
-        result["pronunciation"] = extract_ipa(wikitext)
-        result["explanation_fr"] = extract_definition_fr(wikitext)
-
-    # Word translations
-    result["english_translation"] = mymemory_translate(french_word, "fr|en")
-    result["russian_translation"] = mymemory_translate(french_word, "fr|ru")
-
-    # Definition translation
-    if result["explanation_fr"]:
-        result["explanation_en"] = mymemory_translate(result["explanation_fr"], "fr|en")
-
-    # Example sentence: prefer Tatoeba (native, real), fall back to Wiktionary
-    fr_sent, en_sent = fetch_tatoeba_example(french_word, "eng")
-    if fr_sent:
-        result["example_fr"] = fr_sent
-        result["example_en"] = en_sent
-    elif wikitext:
-        wik_ex = extract_example_fr(wikitext)
-        if wik_ex:
-            result["example_fr"] = wik_ex
-            result["example_en"] = mymemory_translate(wik_ex, "fr|en")
-
-    return result
-
-
-# ---------- UI ----------
-
-def show_word_card(row, show_review_buttons=False):
+def show_word_card(row, show_review_buttons=False, idx=None):
     with st.container(border=True):
-        st.subheader(row["french_word"])
+        head = row["french_word"]
+        alt = _val(row, "alt_form")
+        if alt:
+            head = f"{head} / {alt}"
+        if idx is not None:
+            st.subheader(f"{idx}. {head}")
+        else:
+            st.subheader(head)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown(f"**English:** {row['english_translation'] or '-'}")
-            st.markdown(f"**Russian:** {row['russian_translation'] or '-'}")
-            st.markdown(f"**Pronunciation:** {row['pronunciation'] or '-'}")
-        with col2:
-            st.markdown(f"**Next review:** {row['next_review']}")
-            st.markdown(f"**Reviews:** {row['review_count']}")
-            st.markdown(f"**Difficulty:** {row['difficulty']}")
+        st.markdown(f"**Meaning / English:** {_val(row, 'english_translation') or '-'}")
+        st.markdown(f"**Русский:** {_val(row, 'russian_translation') or '-'}")
 
-        st.markdown("**Explanation in French:**")
-        st.write(row["explanation_fr"] or "-")
-        st.markdown("**Explanation in English:**")
-        st.write(row["explanation_en"] or "-")
+        use_fr = _val(row, "explanation_fr")
+        if use_fr:
+            st.markdown(f"**Use / Français :** {use_fr}")
 
-        st.markdown("**Example:**")
-        st.write(row["example_fr"] or "-")
-        st.write(row["example_en"] or "-")
+        fr_lines = _split_ex(_val(row, "example_fr"))
+        en_lines = _split_ex(_val(row, "example_en"))
+        ru_lines = _split_ex(_val(row, "example_ru"))
 
-        if row["notes"]:
-            st.markdown("**Notes:**")
-            st.write(row["notes"])
+        if fr_lines:
+            st.markdown("**Examples:**")
+            for i, fr in enumerate(fr_lines):
+                st.markdown(f"**Exemple :** {fr}")
+                if i < len(en_lines) and en_lines[i]:
+                    st.markdown(f"&nbsp;&nbsp;&nbsp;English: {en_lines[i]}", unsafe_allow_html=True)
+                if i < len(ru_lines) and ru_lines[i]:
+                    st.markdown(f"&nbsp;&nbsp;&nbsp;Русский: {ru_lines[i]}", unsafe_allow_html=True)
+
+        pron = _val(row, "pronunciation")
+        alt_pron = _val(row, "alt_pronunciation")
+        if pron or alt_pron:
+            combined = " / ".join(x for x in [pron, alt_pron] if x)
+            st.markdown(f"**Prononciation :** {combined}")
+
+        with st.expander("Review info"):
+            st.caption(
+                f"Next review: {row['next_review']} · Reviews: {row['review_count']} · Difficulty: {row['difficulty']}"
+            )
+
+        notes = _val(row, "notes")
+        if notes:
+            st.markdown(f"**Notes:** {notes}")
 
         if show_review_buttons:
             st.markdown("**How well did you remember this word?**")
@@ -370,51 +309,66 @@ def show_word_card(row, show_review_buttons=False):
                         st.rerun()
 
 
+# ---------- Pages ----------
+
 def add_word_page():
     st.header("Add a French word")
-    st.write("Type a French word, auto-fill from Wiktionary + MyMemory, then edit and save.")
 
     prefill = st.session_state.setdefault("prefill", {f: "" for f in AI_FIELDS})
+    api_key = get_api_key()
 
     with st.container(border=True):
-        st.markdown("**Auto-fill from public sources**")
-        st.caption("Wiktionary (IPA + definition) · Tatoeba (real example sentences) · MyMemory (translations). Free, no key.")
+        st.markdown("**Auto-fill with Gemini** (free tier)")
+        st.caption("Uses Google Gemini to generate a full flashcard: alt form, both IPAs, meaning EN + RU, use in French, 3 example triples.")
+        if not api_key:
+            st.warning("No Gemini API key found. Paste one in the sidebar, or set GEMINI_API_KEY in your environment / secrets.toml.")
 
         word_to_generate = st.text_input(
             "French word",
             key="ai_word_input",
-            placeholder="préserver",
+            placeholder="encombrant",
         )
-        if st.button("Auto-fill", type="primary"):
+        if st.button("Auto-fill", type="primary", disabled=not api_key):
             if not word_to_generate.strip():
                 st.error("Enter a French word first.")
             else:
                 try:
-                    with st.spinner("Fetching data..."):
-                        result = generate_word_data(word_to_generate.strip())
-                    if not any(result.values()):
-                        st.warning("Nothing found. Check spelling, or fill in manually below.")
-                    else:
-                        st.session_state["prefill"] = result
-                        st.session_state["prefill_french"] = word_to_generate.strip()
-                        st.success("Fields filled. Review below and save.")
-                        st.rerun()
-                except requests.RequestException as e:
-                    st.error(f"Network error: {e}")
+                    with st.spinner("Asking Gemini..."):
+                        result = generate_word_data(word_to_generate.strip(), api_key)
+                    st.session_state["prefill"] = result
+                    st.session_state["prefill_french"] = word_to_generate.strip()
+                    st.success("Fields filled. Review below and save.")
+                    st.rerun()
+                except json.JSONDecodeError:
+                    st.error("Gemini didn't return valid JSON. Try again.")
+                except requests.HTTPError as e:
+                    st.error(f"Gemini API error: {e.response.status_code} — {e.response.text[:300]}")
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
     with st.form("add_word_form", clear_on_submit=True):
         french_word = st.text_input(
             "French word *",
             value=st.session_state.get("prefill_french", ""),
-            placeholder="préserver",
+            placeholder="encombrant",
         )
-        english_translation = st.text_input("English translation", value=prefill["english_translation"])
-        russian_translation = st.text_input("Russian translation", value=prefill["russian_translation"])
-        pronunciation = st.text_input("Pronunciation", value=prefill["pronunciation"], placeholder="/pʁe.zɛʁ.ve/")
-        explanation_fr = st.text_area("Explanation in French", value=prefill["explanation_fr"])
-        explanation_en = st.text_area("Explanation in English", value=prefill["explanation_en"])
-        example_fr = st.text_area("Example in French", value=prefill["example_fr"])
-        example_en = st.text_area("Example in English", value=prefill["example_en"])
+        alt_form = st.text_input("Alt form (feminine / plural / noun-vs-verb)", value=prefill["alt_form"])
+
+        c1, c2 = st.columns(2)
+        with c1:
+            pronunciation = st.text_input("Pronunciation", value=prefill["pronunciation"], placeholder="[ɑ̃.kɔ̃.bʁɑ̃]")
+        with c2:
+            alt_pronunciation = st.text_input("Alt pronunciation", value=prefill["alt_pronunciation"], placeholder="[ɑ̃.kɔ̃.bʁɑ̃t]")
+
+        english_translation = st.text_input("Meaning / English", value=prefill["english_translation"])
+        russian_translation = st.text_input("Русский", value=prefill["russian_translation"])
+        explanation_fr = st.text_area("Use / Français (On utilise...)", value=prefill["explanation_fr"])
+
+        st.caption("Examples: keep sentences in matching order across FR / EN / RU (separated by blank lines).")
+        example_fr = st.text_area("Examples in French", value=prefill["example_fr"], height=160)
+        example_en = st.text_area("Examples in English", value=prefill["example_en"], height=160)
+        example_ru = st.text_area("Examples in Russian", value=prefill["example_ru"], height=160)
+
         notes = st.text_area("Notes", placeholder="Grammar notes, synonyms, common mistakes...")
 
         submitted = st.form_submit_button("Save word")
@@ -425,13 +379,15 @@ def add_word_page():
             return
         add_word({
             "french_word": french_word,
+            "alt_form": alt_form,
+            "pronunciation": pronunciation,
+            "alt_pronunciation": alt_pronunciation,
             "english_translation": english_translation,
             "russian_translation": russian_translation,
-            "pronunciation": pronunciation,
             "explanation_fr": explanation_fr,
-            "explanation_en": explanation_en,
             "example_fr": example_fr,
             "example_en": example_en,
+            "example_ru": example_ru,
             "notes": notes,
         })
         st.session_state["prefill"] = {f: "" for f in AI_FIELDS}
@@ -449,8 +405,8 @@ def vocabulary_page():
         return
 
     st.write(f"Total words: {len(rows)}")
-    for row in rows:
-        show_word_card(row)
+    for i, row in enumerate(rows, start=1):
+        show_word_card(row, idx=i)
         if st.button("Delete", key=f"delete_{row['id']}"):
             delete_word(row["id"])
             st.warning(f"Deleted: {row['french_word']}")
@@ -464,8 +420,8 @@ def review_page():
         st.success("No words to review today. Great job!")
         return
     st.write(f"Words due today: {len(rows)}")
-    for row in rows:
-        show_word_card(row, show_review_buttons=True)
+    for i, row in enumerate(rows, start=1):
+        show_word_card(row, show_review_buttons=True, idx=i)
 
 
 def weekly_review_page():
@@ -476,8 +432,8 @@ def weekly_review_page():
         st.success("No words scheduled for review this week.")
         return
     st.write(f"Words to review from today until {end_date.isoformat()}: {len(rows)}")
-    for row in rows:
-        show_word_card(row)
+    for i, row in enumerate(rows, start=1):
+        show_word_card(row, idx=i)
 
 
 def statistics_page():
@@ -500,12 +456,29 @@ def statistics_page():
         st.bar_chart(counts)
 
 
+def sidebar_api_key():
+    with st.sidebar:
+        st.markdown("### Gemini API key")
+        st.caption("Get a free key at aistudio.google.com/apikey")
+        current = st.session_state.get("gemini_api_key", "")
+        key_input = st.text_input(
+            "Paste your Gemini key",
+            value=current,
+            type="password",
+            help="Free tier, no billing needed. Or set GEMINI_API_KEY in env / secrets.toml.",
+        )
+        if key_input != current:
+            st.session_state["gemini_api_key"] = key_input
+
+
 def main():
     st.set_page_config(page_title="French Vocabulary Engine", page_icon="FR", layout="wide")
     init_db()
 
     st.title("French Vocabulary Engine")
-    st.caption("Personal French learning app — spaced repetition + free auto-fill.")
+    st.caption("Personal French flashcards — powered by Gemini free tier + spaced repetition.")
+
+    sidebar_api_key()
 
     page = st.sidebar.radio(
         "Menu",
