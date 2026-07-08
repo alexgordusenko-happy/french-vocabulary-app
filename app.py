@@ -16,12 +16,19 @@ RATING_INTERVALS = {
     "Easy": 14,
 }
 
-# Free-tier friendly models, tried in order. Lite variants have the most generous free quota.
-GEMINI_MODELS = [
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-lite",
-    "gemini-2.0-flash",
-]
+# Model options for the dropdown. Left value = model ID sent to the API,
+# right value = human-readable label with free-tier limits.
+# Order roughly from most-generous-free to least.
+GEMINI_MODEL_OPTIONS = {
+    "gemini-3-1-flash-lite": "Gemini 3.1 Flash Lite — 15 RPM · 500 RPD (best free)",
+    "gemini-3-flash": "Gemini 3 Flash — 5 RPM · 20 RPD",
+    "gemini-2.5-flash-lite": "Gemini 2.5 Flash Lite — 10 RPM · 20 RPD",
+    "gemini-2.5-flash": "Gemini 2.5 Flash — 5 RPM · 20 RPD",
+    "gemini-2.0-flash-lite": "Gemini 2.0 Flash Lite",
+    "gemini-2.0-flash": "Gemini 2.0 Flash",
+}
+DEFAULT_MODEL = "gemini-3-1-flash-lite"
+
 GEMINI_URL_TMPL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
 AI_FIELDS = [
@@ -207,6 +214,9 @@ def generate_word_data(french_word: str, api_key: str) -> dict:
     if french_word in cache:
         return cache[french_word]
 
+    selected_model = st.session_state.get("gemini_model", DEFAULT_MODEL)
+    fallback_chain = [selected_model] + [m for m in GEMINI_MODEL_OPTIONS if m != selected_model]
+
     prompt = f"""You are a French vocabulary teacher preparing flashcards for a Russian-speaking learner of French.
 
 For the French word or expression: "{french_word}"
@@ -223,18 +233,20 @@ Return ONLY a JSON object with these EXACT keys:
 
 Return ONLY the JSON. No markdown code fences, no commentary."""
 
-    # Try each model in order; fall through on 429/rate-limit errors.
+    # Try selected model first; on 429/503/404 fall through to the rest.
     last_err = None
     text = None
-    for model in GEMINI_MODELS:
+    allow_fallback = st.session_state.get("allow_model_fallback", True)
+    chain = fallback_chain if allow_fallback else [selected_model]
+    for model in chain:
         try:
             text = _call_gemini(model, prompt, api_key)
             st.session_state["last_model_used"] = model
             break
         except requests.HTTPError as e:
             last_err = e
-            if e.response.status_code in (429, 503):
-                continue  # rate limited / overloaded — try next model
+            if e.response.status_code in (429, 404, 503):
+                continue  # rate limited / not found / overloaded — try next
             raise
     if text is None:
         raise last_err
@@ -346,7 +358,8 @@ def add_word_page():
 
     with st.container(border=True):
         st.markdown("**Auto-fill with Gemini** (free tier)")
-        st.caption("Uses Google Gemini to generate a full flashcard: alt form, both IPAs, meaning EN + RU, use in French, 3 example triples.")
+        selected = st.session_state.get("gemini_model", DEFAULT_MODEL)
+        st.caption(f"Model: `{selected}` · Change in sidebar.")
         if not api_key:
             st.warning("No Gemini API key found. Paste one in the sidebar, or set GEMINI_API_KEY in your environment / secrets.toml.")
 
@@ -508,6 +521,41 @@ def sidebar_api_key():
         )
         if key_input != current:
             st.session_state["gemini_api_key"] = key_input
+
+        st.markdown("### Model")
+        model_keys = list(GEMINI_MODEL_OPTIONS.keys()) + ["__custom__"]
+        current_model = st.session_state.get("gemini_model", DEFAULT_MODEL)
+        if current_model not in model_keys:
+            model_keys.insert(-1, current_model)
+
+        def _fmt(k):
+            if k == "__custom__":
+                return "Custom model ID..."
+            return GEMINI_MODEL_OPTIONS.get(k, k)
+
+        choice = st.selectbox(
+            "Which Gemini model?",
+            options=model_keys,
+            index=model_keys.index(current_model) if current_model in model_keys else 0,
+            format_func=_fmt,
+        )
+        if choice == "__custom__":
+            custom = st.text_input(
+                "Custom model ID",
+                value=current_model if current_model not in GEMINI_MODEL_OPTIONS else "",
+                placeholder="gemini-3-1-flash-lite",
+            )
+            if custom:
+                st.session_state["gemini_model"] = custom.strip()
+        else:
+            st.session_state["gemini_model"] = choice
+
+        st.session_state["allow_model_fallback"] = st.checkbox(
+            "Fall back to other models on rate limit",
+            value=st.session_state.get("allow_model_fallback", True),
+            help="If your selected model returns 429/404, try the others automatically.",
+        )
+        st.caption("Check your quotas at [ai.dev/rate-limit](https://ai.dev/rate-limit).")
 
 
 def main():
